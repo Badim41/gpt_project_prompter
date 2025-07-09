@@ -1,4 +1,6 @@
+import json
 import os
+import re
 
 SEARCH_FILES_PROMPT = """
 # Задача
@@ -16,6 +18,71 @@ SEARCH_FILES_PROMPT = """
 
 # Структура проекта
 """
+
+
+def quick_fix_json(json_string):
+    """
+    Быстрое исправление JSON - заменяет внутренние кавычки на одинарные
+    """
+
+    # Находим все строковые значения и заменяем в них кавычки
+
+    def fix_value(match):
+        value = match.group(1)
+        # Заменяем все внутренние кавычки на одинарные
+        return ':"' + value.replace('"', "'") + '"'
+
+    # Паттерн для значений в кавычках после двоеточия
+    pattern = r':\s*"([^"]*(?:"[^"]*)*)"'
+
+    # Исправляем JSON
+    fixed = json_string
+    while True:
+        new_fixed = re.sub(pattern, fix_value, fixed)
+        if new_fixed == fixed:
+            break
+        fixed = new_fixed
+
+    return fixed
+
+
+def convert_answer_to_json(answer: str, keys, start_symbol="{", end_symbol="}", attemtp=1) -> [bool, dict]:
+    if isinstance(keys, str):
+        keys = [keys]
+
+    answer = answer.replace(" ", "").replace(" None", " null").replace(" False", " false").replace(" True", " true")
+
+    if attemtp == 2:
+        # 'find'
+        if start_symbol in answer and end_symbol in answer:
+            answer = answer[answer.find(start_symbol):]
+            answer = answer[:answer.find(end_symbol) + 1]
+        else:
+            return False, "Не json"
+    elif attemtp == 1:
+        # 'rfind'
+        if start_symbol in answer and end_symbol in answer:
+            answer = answer[answer.find(start_symbol):]
+            answer = answer[:answer.rfind(end_symbol) + 1]
+        else:
+            return False, "Не json"
+    else:
+        return False, "ERROR"
+
+    try:
+        try:
+            response = json.loads(answer)
+        except json.JSONDecodeError as e:
+            answer = quick_fix_json(answer)
+            response = json.loads(answer)
+
+        for key in keys:
+            if response.get(key, "NULL_VALUE") == "NULL_VALUE":
+                return False, "Нет ключа"
+        return True, response
+    except json.JSONDecodeError as e:
+        return convert_answer_to_json(answer=answer, keys=keys, start_symbol=start_symbol, end_symbol=end_symbol,
+                                      attemtp=attemtp + 1)
 
 
 def get_project_structure(path=".", prefix="", gpt_format=True, base_path=None, ignore_folders=None):
@@ -78,9 +145,8 @@ def get_project_files_from_list(file_list: list, base_path="."):
     return output.strip()
 
 
-def get_gpt_prompt(network_tools, path, ignore_folders, task, model="claude-4-opus-thinking", print_file_list=False, file_list=None):
-    from discord_tools.str_tools import convert_answer_to_json
-
+def get_gpt_prompt(network_tools, path, ignore_folders, task, model="claude-4-opus-thinking", print_file_list=False,
+                   file_list=None):
     project_structure = get_project_structure(path, ignore_folders=ignore_folders)
 
     if not file_list:
