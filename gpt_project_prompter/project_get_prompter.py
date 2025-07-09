@@ -78,18 +78,23 @@ def get_project_files_from_list(file_list: list, base_path="."):
     return output.strip()
 
 
-def get_gpt_prompt(network_tools, path, ignore_folders, task, model="claude-4-opus-thinking"):
+def get_gpt_prompt(network_tools, path, ignore_folders, task, model="claude-4-opus-thinking", print_file_list=False, file_list=None):
     from discord_tools.str_tools import convert_answer_to_json
 
     project_structure = get_project_structure(path, ignore_folders=ignore_folders)
-    full_prompt = SEARCH_FILES_PROMPT.format(task) + project_structure
 
-    response = network_tools.chatgpt_api(
-        prompt=full_prompt,
-        model=model
-    )
+    if not file_list:
+        full_prompt = SEARCH_FILES_PROMPT.format(task) + project_structure
 
-    converted, file_list = convert_answer_to_json(response.response.text, keys=[], start_symbol="[", end_symbol="]")
+        response = network_tools.chatgpt_api(
+            prompt=full_prompt,
+            model=model
+        )
+
+        converted, file_list = convert_answer_to_json(response.response.text, keys=[], start_symbol="[", end_symbol="]")
+
+        if print_file_list:
+            print("file_list", file_list)
 
     project_files = get_project_files_from_list(file_list, path)
 
