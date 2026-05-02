@@ -137,8 +137,9 @@ def get_gpt_prompt(
             prompt=full_prompt,
             model=model
         )
+        response_text = response.response.text.replace("\\\\", "/").replace("//", "/").replace("\\", "/")
 
-        converted, file_list = convert_answer_to_json(response.response.text, keys=[], start_symbol="[", end_symbol="]")
+        converted, file_list = convert_answer_to_json(response_text, keys=[], start_symbol="[", end_symbol="]")
 
         # Если не удалось получить список, инициализируем пустым
         if not converted:
