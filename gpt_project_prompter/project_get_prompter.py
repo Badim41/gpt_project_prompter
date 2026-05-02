@@ -1,6 +1,12 @@
 import json
 import os
 import re
+import inspect
+
+from convert_gpt_answer import convert_answer_to_json
+from network_tools import NetworkToolsAPI
+
+# https://github.com/Badim41/convert_gpt_answer
 
 SEARCH_FILES_PROMPT = """
 # Задача
@@ -20,86 +26,31 @@ SEARCH_FILES_PROMPT = """
 """
 
 
-def quick_fix_json(json_string):
-    """
-    Быстрое исправление JSON - заменяет внутренние кавычки на одинарные
-    """
-
-    # Находим все строковые значения и заменяем в них кавычки
-
-    def fix_value(match):
-        value = match.group(1)
-        # Заменяем все внутренние кавычки на одинарные
-        return ':"' + value.replace('"', "'") + '"'
-
-    # Паттерн для значений в кавычках после двоеточия
-    pattern = r':\s*"([^"]*(?:"[^"]*)*)"'
-
-    # Исправляем JSON
-    fixed = json_string
-    while True:
-        new_fixed = re.sub(pattern, fix_value, fixed)
-        if new_fixed == fixed:
-            break
-        fixed = new_fixed
-
-    return fixed
-
-
-def convert_answer_to_json(answer: str, keys, start_symbol="{", end_symbol="}", attemtp=1) -> [bool, dict]:
-    if isinstance(keys, str):
-        keys = [keys]
-
-    answer = answer.replace(" ", "").replace(" None", " null").replace(" False", " false").replace(" True", " true")
-
-    if attemtp == 2:
-        # 'find'
-        if start_symbol in answer and end_symbol in answer:
-            answer = answer[answer.find(start_symbol):]
-            answer = answer[:answer.find(end_symbol) + 1]
-        else:
-            return False, "Не json"
-    elif attemtp == 1:
-        # 'rfind'
-        if start_symbol in answer and end_symbol in answer:
-            answer = answer[answer.find(start_symbol):]
-            answer = answer[:answer.rfind(end_symbol) + 1]
-        else:
-            return False, "Не json"
-    else:
-        return False, "ERROR"
-
-    try:
-        try:
-            response = json.loads(answer)
-        except json.JSONDecodeError as e:
-            answer = quick_fix_json(answer)
-            response = json.loads(answer)
-
-        for key in keys:
-            if response.get(key, "NULL_VALUE") == "NULL_VALUE":
-                return False, "Нет ключа"
-        return True, response
-    except json.JSONDecodeError as e:
-        return convert_answer_to_json(answer=answer, keys=keys, start_symbol=start_symbol, end_symbol=end_symbol,
-                                      attemtp=attemtp + 1)
-
-
-def get_project_structure(path=".", prefix="", gpt_format=True, base_path=None, ignore_folders=None):
+def get_project_structure(path=".", prefix="", gpt_format=True, base_path=None, ignore_folders=None,
+                          ignore_file_list=None):
     if base_path is None:
         base_path = os.path.abspath(path)
     if ignore_folders is None:
         ignore_folders = []
+    if ignore_file_list is None:
+        ignore_file_list = []
+
+    if not os.path.exists(path):
+        return ""
 
     entries = sorted(os.listdir(path))
-    entries = [e for e in entries if not e.startswith(".")]  # Игнорируем скрытые
+    entries = [e for e in entries if not e.startswith(".")]
     result = ""
 
     for i, entry in enumerate(entries):
         full_path = os.path.join(path, entry)
 
-        # Пропускаем игнорируемые папки
+        # Проверка на игнорируемые папки
         if os.path.isdir(full_path) and entry in ignore_folders:
+            continue
+
+        # Проверка на игнорируемые файлы (по имени)
+        if os.path.isfile(full_path) and entry in ignore_file_list:
             continue
 
         if gpt_format:
@@ -117,7 +68,8 @@ def get_project_structure(path=".", prefix="", gpt_format=True, base_path=None, 
                 prefix + extension,
                 gpt_format=gpt_format,
                 base_path=base_path,
-                ignore_folders=ignore_folders
+                ignore_folders=ignore_folders,
+                ignore_file_list=ignore_file_list
             )
 
     return result
@@ -145,9 +97,38 @@ def get_project_files_from_list(file_list: list, base_path="."):
     return output.strip()
 
 
-def get_gpt_prompt(network_tools, path, ignore_folders, task, model="claude-4-opus-thinking", print_file_list=False,
-                   file_list=None):
-    project_structure = get_project_structure(path, ignore_folders=ignore_folders)
+def get_gpt_prompt(
+        network_tools: NetworkToolsAPI,
+        path=None,
+        ignore_folders=None,
+        task="Выведи все файлы из проекта",
+        model="gemini-3-0-flash",
+        print_file_list=False,
+        file_list=None,
+        ignore_file_list=None
+):
+    """
+    Формирует полный промпт для LLM, включая структуру проекта и содержимое необходимых файлов.
+
+    :param network_tools: Объект для работы с API нейросети.
+    :param path: Путь к корневой директории проекта. Если None, берется директория вызывающего скрипта.
+    :param ignore_folders: Список имен папок, которые нужно полностью исключить из сканирования (например, ['venv', 'node_modules']).
+    :param task: Описание задачи, которую должна выполнить нейросеть.
+    :param model: Название модели нейросети для предварительного выбора файлов.
+    :param print_file_list: Если True, выводит в консоль список файлов, отобранных нейросетью.
+    :param file_list: Готовый список путей к файлам. Если передан, нейросеть не будет опрашиваться для поиска файлов.
+    :param ignore_file_list: Список конкретных имен файлов (без путей), которые нужно игнорировать (например, ['settings.json']).
+    :return: Отформатированная строка промпта со структурой, контентом файлов и текстом задачи.
+    """
+
+    # Если путь не указан, берем папку того файла, который вызвал эту функцию
+    if path is None:
+        caller_frame = inspect.stack()[1]
+        caller_filename = caller_frame.filename
+        path = os.path.dirname(os.path.abspath(caller_filename))
+
+    root_folder_name = os.path.basename(os.path.abspath(path))
+    project_structure = get_project_structure(path, ignore_folders=ignore_folders, ignore_file_list=ignore_file_list)
 
     if not file_list:
         full_prompt = SEARCH_FILES_PROMPT.format(task) + project_structure
@@ -159,13 +140,17 @@ def get_gpt_prompt(network_tools, path, ignore_folders, task, model="claude-4-op
 
         converted, file_list = convert_answer_to_json(response.response.text, keys=[], start_symbol="[", end_symbol="]")
 
+        # Если не удалось получить список, инициализируем пустым
+        if not converted:
+            file_list = []
+
         if print_file_list:
-            print("file_list", file_list)
+            print("file_list = ", file_list)
 
     project_files = get_project_files_from_list(file_list, path)
 
     result = (
-        f"# Структура проекта\n{project_structure}\n\n"
+        f"# Структура проекта {root_folder_name}\n{project_structure}\n\n"
         f"# Файлы\n{project_files}\n\n"
         f"# Запрос\n\n"
     )
