@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='gpt_project_prompter',
-    version='1.4',
+    version='2.0',
     packages=find_packages(),
     install_requires=[
         'network_tools @ git+https://github.com/Badim41/network_tools.git',

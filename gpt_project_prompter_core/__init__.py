@@ -1,0 +1,1 @@
+# Архитектурный модуль gpt_project_prompter_core

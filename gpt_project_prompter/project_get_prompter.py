@@ -1,162 +1,116 @@
-import json
 import os
-import re
-import inspect
+from collections.abc import Sequence
+from pathlib import Path
 
-from convert_gpt_answer import convert_answer_to_json
 from network_tools import NetworkToolsAPI
 
-# https://github.com/Badim41/convert_gpt_answer
+from gpt_project_prompter_core.coordinator import (
+    SEARCH_FILES_PROMPT_TEMPLATE,
+    PromptWorkflowCoordinator,
+)
+from gpt_project_prompter_core.dispatcher import OutputDispatcher
+from gpt_project_prompter_core.domain import (
+    ProjectScanConfig,
+    PromptGenerationResult,
+)
+from gpt_project_prompter_core.reader import SafeFileReader
+from gpt_project_prompter_core.scanner import ProjectScanner
+from gpt_project_prompter_core.storage import SQLiteCacheRepository
 
-SEARCH_FILES_PROMPT = """
-# Задача
-
-Выведи пути к файлам, которые могут понадобиться для данной задачи:
-{}
-
-# Формат ответа
-
-Строго List[str] (json)
-
-## Примеры ответа
-
-["path/to/file_1","path/to/file_2"]
-
-# Структура проекта
-"""
+SEARCH_FILES_PROMPT: str = SEARCH_FILES_PROMPT_TEMPLATE
 
 
-def get_project_structure(path=".", prefix="", gpt_format=True, base_path=None, ignore_folders=None,
-                          ignore_file_list=None):
-    if base_path is None:
-        base_path = os.path.abspath(path)
-    if ignore_folders is None:
-        ignore_folders = []
-    if ignore_file_list is None:
-        ignore_file_list = []
+def get_project_structure(
+    path: str | Path = ".",
+    prefix: str = "",
+    gpt_format: bool = True,
+    base_path: str | Path | None = None,
+    ignore_folders: Sequence[str] | None = None,
+    ignore_file_list: Sequence[str] | None = None,
+) -> str:
+    target_root = Path(path).resolve()
+    base_root = Path(base_path).resolve() if base_path is not None else target_root
+    folders_set = frozenset(ignore_folders) if ignore_folders else frozenset()
+    files_set = frozenset(ignore_file_list) if ignore_file_list else frozenset()
 
-    if not os.path.exists(path):
-        return ""
-
-    entries = sorted(os.listdir(path))
-    entries = [e for e in entries if not e.startswith(".")]
-    result = ""
-
-    for i, entry in enumerate(entries):
-        full_path = os.path.join(path, entry)
-
-        # Проверка на игнорируемые папки
-        if os.path.isdir(full_path) and entry in ignore_folders:
-            continue
-
-        # Проверка на игнорируемые файлы (по имени)
-        if os.path.isfile(full_path) and entry in ignore_file_list:
-            continue
-
-        if gpt_format:
-            if os.path.isfile(full_path):
-                relative_path = os.path.relpath(full_path, start=base_path)
-                result += relative_path.replace("/", "\\") + "\n"
-        else:
-            connector = "└── " if i == len(entries) - 1 else "├── "
-            result += prefix + connector + entry + "\n"
-
-        if os.path.isdir(full_path):
-            extension = "" if gpt_format else ("    " if i == len(entries) - 1 else "│   ")
-            result += get_project_structure(
-                full_path,
-                prefix + extension,
-                gpt_format=gpt_format,
-                base_path=base_path,
-                ignore_folders=ignore_folders,
-                ignore_file_list=ignore_file_list
-            )
-
-    return result
+    scanner = ProjectScanner()
+    config = ProjectScanConfig(
+        root_path=target_root,
+        ignore_folders=folders_set,
+        ignore_files=files_set,
+        gpt_format=gpt_format,
+        prefix=prefix,
+        base_path=base_root,
+    )
+    snapshot = scanner.scan(config)
+    return snapshot.structure_text
 
 
-def get_project_files_from_list(file_list: list, base_path="."):
-    base_path = os.path.abspath(base_path)
-    output = ""
-
-    for relative_path in file_list:
-        full_path = os.path.join(base_path, relative_path)
-        if not os.path.isfile(full_path):
-            print(f"{relative_path}\n⚠️ Файл не найден.\n\n")
-            continue
-
-        output += f"## {relative_path}\n"
-        try:
-            with open(full_path, encoding="utf-8") as f:
-                output += f.read().strip() + "\n\n"
-        except UnicodeDecodeError:
-            print("⚠️ Не удалось прочитать файл (ошибка декодирования).\n\n")
-        except Exception as e:
-            print(f"⚠️ Ошибка при чтении файла: {e}\n\n")
-
-    return output.strip()
+def get_project_files_from_list(
+    file_list: Sequence[str],
+    base_path: str | Path = ".",
+) -> str:
+    target_root = Path(base_path).resolve()
+    reader = SafeFileReader()
+    return reader.read_files_content(
+        root_path=target_root,
+        relative_paths=file_list,
+    )
 
 
 def get_gpt_prompt(
-        network_tools: NetworkToolsAPI,
-        path=None,
-        ignore_folders=None,
-        task="Выведи все файлы из проекта",
-        model="gemini-3-0-flash",
-        print_file_list=False,
-        file_list=None,
-        ignore_file_list=None
-):
+    network_tools: NetworkToolsAPI,
+    path: str | Path | None = None,
+    ignore_folders: Sequence[str] | None = None,
+    task: str = "Выведи все файлы из проекта",
+    model: str = "gemini-3-0-flash",
+    print_file_list: bool = False,
+    file_list: Sequence[str] | None = None,
+    ignore_file_list: Sequence[str] | None = None,
+) -> str:
     """
-    Формирует полный промпт для LLM, включая структуру проекта и содержимое необходимых файлов.
+    Формирует полный промпт для LLM с двухуровневым кэшированием в SQLite и контролем вывода.
 
     :param network_tools: Объект для работы с API нейросети.
-    :param path: Путь к корневой директории проекта. Если None, берется директория вызывающего скрипта.
-    :param ignore_folders: Список имен папок, которые нужно полностью исключить из сканирования (например, ['venv', 'node_modules']).
+    :param path: Путь к корневой директории проекта. Если None, используется текущая рабочая директория (CWD).
+    :param ignore_folders: Список имен папок, которые нужно исключить из сканирования.
     :param task: Описание задачи, которую должна выполнить нейросеть.
     :param model: Название модели нейросети для предварительного выбора файлов.
-    :param print_file_list: Если True, выводит в консоль список файлов, отобранных нейросетью.
-    :param file_list: Готовый список путей к файлам. Если передан, нейросеть не будет опрашиваться для поиска файлов.
-    :param ignore_file_list: Список конкретных имен файлов (без путей), которые нужно игнорировать (например, ['settings.json']).
+    :param print_file_list: Если True, выводит в консоль список отобранных файлов.
+    :param file_list: Готовый список путей к файлам. Если передан, нейросеть не опрашивается.
+    :param ignore_file_list: Список конкретных имен файлов, которые нужно игнорировать.
     :return: Отформатированная строка промпта со структурой, контентом файлов и текстом задачи.
     """
+    resolved_path = Path(path).resolve() if path is not None else Path.cwd().resolve()
+    folders_set = frozenset(ignore_folders) if ignore_folders else frozenset()
+    files_set = frozenset(ignore_file_list) if ignore_file_list else frozenset()
 
-    # Если путь не указан, берем папку того файла, который вызвал эту функцию
-    if path is None:
-        caller_frame = inspect.stack()[1]
-        caller_filename = caller_frame.filename
-        path = os.path.dirname(os.path.abspath(caller_filename))
+    db_path = resolved_path / ".get_gpt_project" / "cache.db"
 
-    root_folder_name = os.path.basename(os.path.abspath(path))
-    project_structure = get_project_structure(path, ignore_folders=ignore_folders, ignore_file_list=ignore_file_list)
+    scanner = ProjectScanner()
+    cache_repo = SQLiteCacheRepository(db_path=db_path)
+    file_reader = SafeFileReader()
+    dispatcher = OutputDispatcher()
 
-    if not file_list:
-        full_prompt = SEARCH_FILES_PROMPT.format(task) + project_structure
-
-        response = network_tools.chatgpt_api(
-            prompt=full_prompt,
-            model=model
-        )
-        response_text = response.response.text.replace("\\\\", "/").replace("//", "/").replace("\\", "/")
-
-        converted, file_list = convert_answer_to_json(response_text, keys=[], start_symbol="[", end_symbol="]")
-
-        # Если не удалось получить список, инициализируем пустым
-        if not converted:
-            file_list = []
-
-        if print_file_list:
-            print("file_list = ", file_list)
-
-    project_files = get_project_files_from_list(file_list, path)
-
-    result = (
-        f"# Структура проекта {root_folder_name}\n{project_structure}\n\n"
-        f"# Файлы\n{project_files}\n\n"
-        f"# Запрос\n\n"
+    coordinator = PromptWorkflowCoordinator(
+        scanner=scanner,
+        cache_repo=cache_repo,
+        file_reader=file_reader,
+        dispatcher=dispatcher,
     )
 
-    return result
+    result: PromptGenerationResult = coordinator.run(
+        network_tools=network_tools,
+        root_path=resolved_path,
+        task=task,
+        model=model,
+        ignore_folders=folders_set,
+        ignore_files=files_set,
+        print_file_list=print_file_list,
+        explicit_file_list=file_list,
+    )
+
+    return result.prompt_text
 
 
 """
