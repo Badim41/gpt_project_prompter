@@ -42,3 +42,18 @@ import { strictFormat } from '../utils/text.js';
 # Запрос
 
 ```
+
+### .gitignore
+
+Укажите во избежания утечек секретов:
+```
+# search-replace utils
+
+secret.py
+replacer.py
+get_structure.py
+.get_gpt_project
+.deepsearch
+.deepsearch.db
+prompt_for_project.txt
+```
