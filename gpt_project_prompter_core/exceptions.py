@@ -20,3 +20,7 @@ class ProjectScanIOError(PromptEngineError):
 
 class FileReadLimitExceededError(PromptEngineError):
     """Превышение максимально допустимого размера файла при чтении."""
+
+
+class IndexExtractionError(PromptEngineError):
+    """Внутренняя ошибка извлечения фактов или контура файла."""

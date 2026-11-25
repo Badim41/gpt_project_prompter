@@ -2,7 +2,11 @@
 
 ## Возможности
 
-- Автоматическая формулировка задач для LLM
+- Индексация файлов проекта (вес, строки, размеры изображений, длительность аудио/видео) и контуры символов (Python AST, JS/TS, JSON-схемы, SQL и SQLite).
+- Автоматическое сворачивание мусорных и слишком больших папок (`pyvenv.cfg`, `node_modules`, тысячи картинок) без их обхода; поддержка `git ls-files`.
+- Кэширование выбора LLM и индекса файлов в SQLite (`.get_gpt_project/cache.db`).
+- Поддержка масок `dir/*`, `dir/**` в ответе модели, allowlist-безопасность и строгий бюджет символов (`max_structure_chars`, `max_prompt_chars`).
+- Модель по умолчанию: `gemini-4-hydrogen`.
 
 ## Установка
 ```bash
@@ -12,7 +16,7 @@ pip install git+https://github.com/Badim41/gpt_project_prompter.git
 
 ```python
 from network_tools import NetworkToolsAPI
-from gpt_project_prompter import get_gpt_prompt
+from gpt_project_prompter import DEFAULT_MODEL, get_gpt_prompt, get_project_structure
 
 network = NetworkToolsAPI("your-api-key")
 
@@ -20,17 +24,37 @@ task = "Перевести все запросы к ChatGPT на русский"
 path = "C:/Users/you/your_project"
 ignore = ["node_modules", "__pycache__"]
 
-prompt = get_gpt_prompt(network, path, ignore, task)
+# Полный промпт (модель по умолчанию: gemini-4-hydrogen)
+prompt = get_gpt_prompt(
+    network,
+    path,
+    ignore,
+    task,
+    model=DEFAULT_MODEL,
+    detail_level=3,                 # 0..3: от одних путей до полных сигнатур
+    max_files_in_folder=60,         # x4 автоматически для папок с исходным кодом (>=70%)
+    max_files_in_subtree=5000,
+    max_structure_chars=60_000,
+    max_prompt_chars=500_000,
+    use_git=True,
+    expand_folders=(),              # принудительно развернуть отдельные папки ("a/b")
+    collapse_folders=(),            # принудительно свернуть отдельные папки ("a/b")
+    include_edit_instructions=False # добавить инструкцию replacer в конец промпта
+)
 print(prompt)
+
+# Только структура проекта (detail_level=0 — старый плоский список путей)
+structure = get_project_structure(path, ignore_folders=ignore, detail_level=3)
 ```
 
 ## Пример вывода
 ```
-# Структура проекта
-README.md
-mineflayer-pathfinder\LICENSE
-src/models/gpt.js
-...
+# Структура проекта my_project
+README.md  1.2 KB, 40 стр.
+assets/  [свернуто: много файлов в папке; 1000 файлов, .png 950, .jpg 50]
+src/models/gpt.js  4 KB, 120 стр.
+  class GptClient
+    async ask(prompt)
 
 # Файлы
 ## src/models/gpt.js

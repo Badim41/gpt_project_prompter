@@ -1,124 +1,140 @@
+from __future__ import annotations
+
 import hashlib
 import os
 from pathlib import Path
 
 from gpt_project_prompter_core.domain import (
+    CollapsedFolder,
     ProjectScanConfig,
     ProjectStructureSnapshot,
 )
-from gpt_project_prompter_core.exceptions import ProjectScanIOError
+from gpt_project_prompter_core.file_sources import (
+    FileSourceResult,
+    GitFileSource,
+    WalkFileSource,
+)
+from gpt_project_prompter_core.folder_policy import FolderPolicy, format_collapsed_folder
+from gpt_project_prompter_core.interfaces import FileSourceProtocol
+from gpt_project_prompter_core.renderer import render_tree_from_snapshot
 
 
 class ProjectScanner:
-    def _render_tree(
+    """Оркестрирует выбор источника файлов, политику сворачивания и сборку снимка."""
+
+    def __init__(
         self,
-        dir_path: Path,
-        config: ProjectScanConfig,
-        prefix: str = "",
-        visited_inodes: set[tuple[int, int]] | None = None,
-    ) -> str:
-        if visited_inodes is None:
-            visited_inodes = set()
-
-        try:
-            stat_val = dir_path.stat()
-            inode_key = (stat_val.st_dev, stat_val.st_ino)
-            if inode_key in visited_inodes:
-                return ""
-            visited_inodes.add(inode_key)
-
-            with os.scandir(dir_path) as iterator:
-                entries = [e for e in iterator if not e.name.startswith(".")]
-                entries.sort(key=lambda e: e.name)
-        except (OSError, PermissionError) as exc:
-            raise ProjectScanIOError(f"Ошибка доступа к директории {dir_path}: {exc}") from exc
-
-        filtered: list[os.DirEntry] = []
-        for entry in entries:
-            if entry.is_dir(follow_symlinks=False) and entry.name in config.ignore_folders:
-                continue
-            if entry.is_file(follow_symlinks=False) and entry.name in config.ignore_files:
-                continue
-            filtered.append(entry)
-
-        result_parts: list[str] = []
-        total = len(filtered)
-        for i, entry in enumerate(filtered):
-            is_last = (i == total - 1)
-            connector = "└── " if is_last else "├── "
-            result_parts.append(f"{prefix}{connector}{entry.name}\n")
-
-            if entry.is_dir(follow_symlinks=False):
-                extension = "    " if is_last else "│   "
-                subtree = self._render_tree(
-                    dir_path=Path(entry.path),
-                    config=config,
-                    prefix=prefix + extension,
-                    visited_inodes=visited_inodes,
-                )
-                if subtree:
-                    result_parts.append(subtree)
-
-        return "".join(result_parts)
+        git_source: FileSourceProtocol | None = None,
+        walk_source: FileSourceProtocol | None = None,
+    ) -> None:
+        self._git_source: FileSourceProtocol = git_source or GitFileSource()
+        self._walk_source: FileSourceProtocol = walk_source or WalkFileSource()
 
     def scan(self, config: ProjectScanConfig) -> ProjectStructureSnapshot:
+        """Сканирует проект и возвращает детерминированный ProjectStructureSnapshot."""
         root = config.root_path.resolve()
-        base = config.base_path.resolve() if config.base_path is not None else root
         if not root.exists() or not root.is_dir():
             return ProjectStructureSnapshot(
                 structure_text="",
                 structure_hash=hashlib.sha256(b"").hexdigest(),
                 canonical_relative_paths=(),
+                collapsed_folders=(),
             )
 
-        canonical_paths: list[str] = []
-        visited_inodes: set[tuple[int, int]] = set()
+        policy = FolderPolicy(
+            max_files_in_folder=config.max_files_in_folder,
+            max_files_in_subtree=config.max_files_in_subtree,
+            expand_folders=config.expand_folders,
+            collapse_folders=config.collapse_folders,
+        )
 
-        def _walk(current_dir: Path) -> None:
-            try:
-                stat_val = current_dir.stat()
-                inode_key = (stat_val.st_dev, stat_val.st_ino)
-                if inode_key in visited_inodes:
-                    return
-                visited_inodes.add(inode_key)
+        source_result = self._collect_from_sources(config, policy)
+        files, collapsed = _rebase_paths(source_result, root, config.base_path)
+        structure_hash = _compute_structure_hash(files, collapsed)
 
-                with os.scandir(current_dir) as iterator:
-                    entries = sorted(list(iterator), key=lambda e: e.name)
-            except (OSError, PermissionError) as exc:
-                raise ProjectScanIOError(f"Ошибка доступа к директории {current_dir}: {exc}") from exc
-
-            for entry in entries:
-                if entry.name.startswith("."):
-                    continue
-
-                if entry.is_dir(follow_symlinks=False):
-                    if entry.name in config.ignore_folders:
-                        continue
-                    _walk(Path(entry.path))
-                elif entry.is_file(follow_symlinks=False):
-                    if entry.name in config.ignore_files:
-                        continue
-                    rel_path = os.path.relpath(entry.path, base).replace("\\", "/")
-                    canonical_paths.append(rel_path)
-
-        _walk(root)
-        canonical_paths.sort()
+        preliminary = ProjectStructureSnapshot(
+            structure_text="",
+            structure_hash=structure_hash,
+            canonical_relative_paths=files,
+            collapsed_folders=collapsed,
+        )
 
         if config.gpt_format:
-            structure_text = "\n".join(canonical_paths) + ("\n" if canonical_paths else "")
+            structure_text = _format_plain_structure(files, collapsed)
         else:
-            structure_text = self._render_tree(
-                dir_path=root,
-                config=config,
-                prefix=config.prefix,
-            )
-
-        structure_hash = hashlib.sha256(
-            ("\n".join(canonical_paths) + ("\n" if canonical_paths else "")).encode("utf-8")
-        ).hexdigest()
+            structure_text = render_tree_from_snapshot(preliminary, prefix=config.prefix)
 
         return ProjectStructureSnapshot(
             structure_text=structure_text,
             structure_hash=structure_hash,
-            canonical_relative_paths=tuple(canonical_paths),
+            canonical_relative_paths=files,
+            collapsed_folders=collapsed,
         )
+
+    def _collect_from_sources(
+        self,
+        config: ProjectScanConfig,
+        policy: FolderPolicy,
+    ) -> FileSourceResult:
+        if config.use_git:
+            git_res = self._git_source.collect(config, policy)
+            if git_res is not None:
+                return git_res
+        walk_res = self._walk_source.collect(config, policy)
+        if walk_res is not None:
+            return walk_res
+        return FileSourceResult(files=(), collapsed_folders=())
+
+
+def _rebase_paths(
+    result: FileSourceResult,
+    root: Path,
+    base_path: Path | None,
+) -> tuple[tuple[str, ...], tuple[CollapsedFolder, ...]]:
+    if base_path is None:
+        return result.files, result.collapsed_folders
+    base = base_path.resolve()
+    if base == root:
+        return result.files, result.collapsed_folders
+
+    rebased_files = tuple(
+        sorted(os.path.relpath(root / rel, base).replace("\\", "/") for rel in result.files)
+    )
+    rebased_collapsed = tuple(
+        sorted(
+            (
+                CollapsedFolder(
+                    rel_path=os.path.relpath(root / cf.rel_path, base).replace("\\", "/"),
+                    reason=cf.reason,
+                    file_count=cf.file_count,
+                    is_lower_bound=cf.is_lower_bound,
+                    top_extensions=cf.top_extensions,
+                )
+                for cf in result.collapsed_folders
+            ),
+            key=lambda item: item.rel_path,
+        )
+    )
+    return rebased_files, rebased_collapsed
+
+
+def _compute_structure_hash(
+    files: tuple[str, ...],
+    collapsed: tuple[CollapsedFolder, ...],
+) -> str:
+    # Хэш зависит только от allowlist и путей свёрнутых папок, не от символов/фактов
+    lines = list(files) + [f"COLLAPSED:{cf.rel_path}" for cf in collapsed]
+    payload = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _format_plain_structure(
+    files: tuple[str, ...],
+    collapsed: tuple[CollapsedFolder, ...],
+) -> str:
+    rows: list[tuple[str, str]] = [(p, p) for p in files]
+    rows.extend((f"{cf.rel_path}/", format_collapsed_folder(cf)) for cf in collapsed)
+    rows.sort(key=lambda pair: pair[0])
+    if not rows:
+        return ""
+    return "\n".join(line for _, line in rows) + "\n"
