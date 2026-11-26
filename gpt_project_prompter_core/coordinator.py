@@ -29,7 +29,16 @@ from gpt_project_prompter_core.interfaces import (
 )
 from gpt_project_prompter_core.prompt_builder import build_final_prompt
 from gpt_project_prompter_core.renderer import render_structure
-from gpt_project_prompter_core.selection import resolve_selection
+from gpt_project_prompter_core.selection import (
+    normalize_candidate,
+    prepend_extra_files,
+    resolve_selection,
+)
+
+_ALWAYS_BLOCKED_EXTRA_DIRS: frozenset[str] = frozenset(
+    {".git", ".get_gpt_project", ".replacer_backups"}
+)
+_ALWAYS_BLOCKED_EXTRA_FILES: frozenset[str] = frozenset({".env"})
 
 SEARCH_FILES_PROMPT_TEMPLATE = """# Задача
 
@@ -82,6 +91,7 @@ class PromptWorkflowCoordinator:
         print_file_list: bool = False,
         explicit_file_list: Sequence[str] | None = None,
         *,
+        extra_files: Sequence[str] | None = None,
         max_files_in_folder: int = DEFAULT_MAX_FILES_IN_FOLDER,
         max_files_in_subtree: int = DEFAULT_MAX_FILES_IN_SUBTREE,
         detail_level: int = DEFAULT_DETAIL_LEVEL,
@@ -106,7 +116,17 @@ class PromptWorkflowCoordinator:
         )
 
         snapshot = self._scanner.scan(scan_config)
-        index = self._indexer.index_files(root_resolved, snapshot.canonical_relative_paths)
+        safe_extra, extra_skipped = _resolve_safe_extra_files(
+            extra_files=extra_files,
+            root_resolved=root_resolved,
+            ignore_folders=ignore_folders,
+            ignore_files=ignore_files,
+        )
+        allow_set = frozenset(snapshot.canonical_relative_paths)
+        paths_to_index = list(snapshot.canonical_relative_paths) + [
+            p for p in safe_extra if p not in allow_set
+        ]
+        index = self._indexer.index_files(root_resolved, paths_to_index)
         warnings: list[str] = []
 
         if explicit_file_list is not None:
@@ -136,10 +156,13 @@ class PromptWorkflowCoordinator:
                 is_explicit_user_list=False,
             )
 
+        selection = prepend_extra_files(selection, safe_extra)
+        all_skipped = tuple(dict.fromkeys((*selection.skipped, *extra_skipped)))
+
         if print_file_list:
             print("file_list =", [item.path for item in selection.files])
-            if selection.skipped:
-                print("skipped_paths =", list(selection.skipped))
+            if all_skipped:
+                print("skipped_paths =", list(all_skipped))
 
         built = build_final_prompt(
             root_path=root_resolved,
@@ -166,7 +189,7 @@ class PromptWorkflowCoordinator:
             written_to_file=dispatch_result.written_to_file,
             output_file_path=dispatch_result.output_file_path,
             character_count=dispatch_result.character_count,
-            skipped_paths=selection.skipped,
+            skipped_paths=all_skipped,
             warnings=tuple(dict.fromkeys(warnings)),
         )
 
@@ -247,3 +270,50 @@ def _parse_llm_file_list(raw_text: str) -> list[str] | None:
         return None
     items = [str(item) for item in parsed_files if isinstance(item, str) and item.strip()]
     return items if items else None
+
+
+def _resolve_safe_extra_files(
+    *,
+    extra_files: Sequence[str] | None,
+    root_resolved: Path,
+    ignore_folders: frozenset[str],
+    ignore_files: frozenset[str],
+) -> tuple[list[str], list[str]]:
+    """Валидирует extra_files на безопасность (внутри root, вне ignore) и существование."""
+    if not extra_files:
+        return [], []
+    blocked_dirs = _ALWAYS_BLOCKED_EXTRA_DIRS | ignore_folders
+    blocked_files_lower = {name.lower() for name in (_ALWAYS_BLOCKED_EXTRA_FILES | ignore_files)}
+    accepted: list[str] = []
+    skipped: list[str] = []
+    seen: set[str] = set()
+
+    for raw in extra_files:
+        norm = normalize_candidate(raw)
+        if norm is None:
+            skipped.append(raw)
+            continue
+        parts = norm.split("/")
+        if any(seg in blocked_dirs for seg in parts[:-1]) or parts[-1].lower() in blocked_files_lower:
+            skipped.append(raw)
+            continue
+        try:
+            target = (root_resolved / norm).resolve()
+        except OSError:
+            skipped.append(raw)
+            continue
+        if not target.is_relative_to(root_resolved) or not target.is_file():
+            skipped.append(raw)
+            continue
+        canonical = target.relative_to(root_resolved).as_posix()
+        canonical_parts = canonical.split("/")
+        if (
+            any(seg in blocked_dirs for seg in canonical_parts[:-1])
+            or canonical_parts[-1].lower() in blocked_files_lower
+        ):
+            skipped.append(raw)
+            continue
+        if canonical not in seen:
+            seen.add(canonical)
+            accepted.append(canonical)
+    return accepted, skipped

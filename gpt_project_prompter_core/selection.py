@@ -159,3 +159,27 @@ def _apply_pattern(
         if path not in seen:
             seen.add(path)
             selected.append(SelectedFile(path=path, from_pattern=True))
+
+
+def prepend_extra_files(
+    selection: Selection,
+    extra_paths: Sequence[str],
+) -> Selection:
+    """Добавляет принудительные файлы в начало Selection с высшим приоритетом и дедупликацией."""
+    if not extra_paths:
+        return selection
+    merged: list[SelectedFile] = []
+    seen: set[str] = set()
+    for path in extra_paths:
+        if path not in seen:
+            seen.add(path)
+            merged.append(SelectedFile(path=path, from_pattern=False))
+    for item in selection.files:
+        if item.path not in seen:
+            seen.add(item.path)
+            merged.append(item)
+    return Selection(
+        files=tuple(merged),
+        skipped=selection.skipped,
+        truncated_patterns=selection.truncated_patterns,
+    )
